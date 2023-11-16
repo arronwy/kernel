@@ -772,6 +772,7 @@ config SCHED_OMIT_FRAME_POINTER
 
 menuconfig HYPERVISOR_GUEST
 	bool "Linux guest support"
+	select ARCH_HAS_CC_PLATFORM
 	help
 	  Say Y here to enable options for running Linux under various hyper-
 	  visors. This option enables basic hypervisor detection and platform
@@ -886,6 +887,8 @@ config INTEL_TDX_GUEST
 	select ARCH_HAS_CC_PLATFORM
 	select X86_MEM_ENCRYPT
 	select X86_MCE
+	select UNACCEPTED_MEMORY
+	select EFI_STUB
 	help
 	  Support running as a guest under Intel TDX.  Without this support,
 	  the guest kernel can not boot or run under TDX.
@@ -1535,12 +1538,12 @@ config X86_CPA_STATISTICS
 config X86_MEM_ENCRYPT
 	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
 	select DYNAMIC_PHYSICAL_MASK
+	select DMA_COHERENT_POOL
 	def_bool n
 
 config AMD_MEM_ENCRYPT
 	bool "AMD Secure Memory Encryption (SME) support"
 	depends on X86_64 && CPU_SUP_AMD
-	select DMA_COHERENT_POOL
 	select ARCH_USE_MEMREMAP_PROT
 	select INSTRUCTION_DECODER
 	select ARCH_HAS_CC_PLATFORM
@@ -1951,6 +1954,67 @@ config X86_SGX
 	  hardware.
 
 	  If unsure, say N.
+
+config INTEL_TDX_HOST
+	bool "Intel Trust Domain Extensions (TDX) host support"
+	depends on CPU_SUP_INTEL
+	depends on X86_64
+	depends on KVM_INTEL
+	depends on X86_X2APIC
+	select ARCH_KEEP_MEMBLOCK
+	depends on CONTIG_ALLOC
+	help
+	  Intel Trust Domain Extensions (TDX) protects guest VMs from malicious
+	  host and certain physical attacks.  This option enables necessary TDX
+	  support in host kernel to run protected VMs.
+
+	  If unsure, say N.
+
+config INTEL_TDX_MODULE_UPDATE
+	bool "TDX module loading support"
+	depends on INTEL_TDX_HOST
+	depends on CRYPTO=y
+	depends on CRYPTO_SHA512=y
+	depends on SYSFS
+	help
+	  Intel TDX module provides interfaces for VMM to manage TDs. It acts
+	  as the trust intermediary to help implement security policies,
+	  actions and necessary mitigations for the TDs. This option enables
+	  kernel to load TDX module updates at runtime.
+
+	  If unsure, say N.
+
+config INTEL_TDX_HOST_DEBUG_MEMORY_CORRUPT
+	bool "Intel Trust Domain Extensions (TDX) host debug memory corruption"
+	default n
+	depends on INTEL_TDX_HOST
+	help
+	  Intel Trust Domain Extentions (TDX) encrypts memory and protect it
+	  against host.  By making non-present encrypted memory, detect
+	  unintended memory access to encrypted memory.
+
+	  If unuser, say N.
+
+config INTEL_TDX_HOST_DEBUG
+	tristate "TDX host debugfs"
+	default n
+	depends on INTEL_TDX_HOST
+	depends on DEBUG_FS
+	depends on KVM
+	help
+	  TDX module debug support via debug fs.  The debug version of TDX
+	  module is required.
+
+	  If unsure, say N.
+
+config INTEL_TDX_MODULE_LOADER_OLD
+	bool "TDX module boot-time loader"
+	default n
+	depends on INTEL_TDX_HOST
+	depends on SYSFS
+	select FW_LOADER
+	help
+	  This enables kernel to load P-SEAMLDR and TDX module at boot time.
 
 config EFI
 	bool "EFI runtime service support"

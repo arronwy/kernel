@@ -7,21 +7,25 @@
 #include <linux/cpufeature.h>
 #include <linux/export.h>
 #include <linux/io.h>
+#include <linux/pci.h>
+#include <linux/random.h>
+#include <linux/virtio_anchor.h>
+#include <linux/spinlock.h>
+#include <linux/list.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/platform_device.h>
 #include <asm/coco.h>
 #include <asm/tdx.h>
+#include <asm/i8259.h>
 #include <asm/vmx.h>
 #include <asm/insn.h>
 #include <asm/insn-eval.h>
 #include <asm/pgtable.h>
+#include <asm/irqdomain.h>
 
-/* TDX module Call Leaf IDs */
-#define TDX_GET_INFO			1
-#define TDX_GET_VEINFO			3
-#define TDX_GET_REPORT			4
-#define TDX_ACCEPT_PAGE			6
-
-/* TDX hypercall Leaf IDs */
-#define TDVMCALL_MAP_GPA		0x10001
+#define CREATE_TRACE_POINTS
+#include <asm/trace/tdx.h>
 
 /* MMIO direction */
 #define EPT_READ	0
@@ -37,30 +41,62 @@
 #define VE_GET_PORT_NUM(e)	((e) >> 16)
 #define VE_IS_IO_STRING(e)	((e) & BIT(4))
 
+#define ATTR_DEBUG		BIT(0)
 #define ATTR_SEPT_VE_DISABLE	BIT(28)
 
 /* TDX Module call error codes */
 #define TDCALL_RETURN_CODE(a)	((a) >> 32)
 #define TDCALL_INVALID_OPERAND	0xc0000100
+#define TDCALL_OPERAND_BUSY	0x80000200
 
 #define TDREPORT_SUBTYPE_0	0
 
-/*
- * Wrapper for standard use of __tdx_hypercall with no output aside from
- * return code.
- */
-static inline u64 _tdx_hypercall(u64 fn, u64 r12, u64 r13, u64 r14, u64 r15)
-{
-	struct tdx_hypercall_args args = {
-		.r10 = TDX_HYPERCALL_STANDARD,
-		.r11 = fn,
-		.r12 = r12,
-		.r13 = r13,
-		.r14 = r14,
-		.r15 = r15,
-	};
+/* Caches TD Attributes from TDG.VP.INFO TDCALL */
+static u64 td_attr;
+static u64 cc_mask;
 
-	return __tdx_hypercall(&args, 0);
+struct event_irq_entry {
+	tdx_event_irq_cb_t handler;
+	void *data;
+	struct list_head head;
+};
+
+static int tdx_event_irq __ro_after_init;
+static int tdx_event_irq_vector __ro_after_init;
+static LIST_HEAD(event_irq_cb_list);
+static DEFINE_SPINLOCK(event_irq_cb_lock);
+
+/* Traced version of __tdx_hypercall */
+static u64 __trace_tdx_hypercall(struct tdx_hypercall_args *args,
+		unsigned long flags)
+{
+	u64 err;
+
+	trace_tdx_hypercall_enter_rcuidle(args->r11, args->r12, args->r13,
+			args->r14, args->r15);
+	err = __tdx_hypercall(args, flags);
+	trace_tdx_hypercall_exit_rcuidle(err, args->r11, args->r12,
+			args->r13, args->r14, args->r15);
+
+	return err;
+}
+
+/* Traced version of __tdx_module_call */
+static u64 __trace_tdx_module_call(u64 fn, u64 rcx, u64 rdx, u64 r8,
+		u64 r9, struct tdx_module_output *out)
+{
+	struct tdx_module_output dummy_out;
+	u64 err;
+
+	if (!out)
+		out = &dummy_out;
+
+	trace_tdx_module_call_enter_rcuidle(fn, rcx, rdx, r8, r9);
+	err = __tdx_module_call(fn, rcx, rdx, r8, r9, 0, 0, 0, 0, out);
+	trace_tdx_module_call_exit_rcuidle(err, out->rcx, out->rdx,
+			out->r8, out->r9, out->r10, out->r11);
+
+	return err;
 }
 
 /* Called from __tdx_hypercall() for unrecoverable failure */
@@ -92,7 +128,7 @@ long tdx_kvm_hypercall(unsigned int nr, unsigned long p1, unsigned long p2,
 		.r14 = p4,
 	};
 
-	return __tdx_hypercall(&args, 0);
+	return __trace_tdx_hypercall(&args, 0);
 }
 EXPORT_SYMBOL_GPL(tdx_kvm_hypercall);
 #endif
@@ -105,7 +141,7 @@ EXPORT_SYMBOL_GPL(tdx_kvm_hypercall);
 static inline void tdx_module_call(u64 fn, u64 rcx, u64 rdx, u64 r8, u64 r9,
 				   struct tdx_module_output *out)
 {
-	if (__tdx_module_call(fn, rcx, rdx, r8, r9, out))
+	if (__trace_tdx_module_call(fn, rcx, rdx, r8, r9, out))
 		panic("TDCALL %lld failed (Buggy TDX module!)\n", fn);
 }
 
@@ -129,7 +165,7 @@ int tdx_mcall_get_report0(u8 *reportdata, u8 *tdreport)
 
 	ret = __tdx_module_call(TDX_GET_REPORT, virt_to_phys(tdreport),
 				virt_to_phys(reportdata), TDREPORT_SUBTYPE_0,
-				0, NULL);
+				0, 0, 0, 0, 0, NULL);
 	if (ret) {
 		if (TDCALL_RETURN_CODE(ret) == TDCALL_INVALID_OPERAND)
 			return -EINVAL;
@@ -140,11 +176,164 @@ int tdx_mcall_get_report0(u8 *reportdata, u8 *tdreport)
 }
 EXPORT_SYMBOL_GPL(tdx_mcall_get_report0);
 
+/**
+ * tdx_mcall_verify_report() - Wrapper for TDG.MR.VERIFYREPORT TDCALL.
+ * @reportmac: Address of the input buffer which contains REPORTMACSTRUCT.
+ *
+ * Refer to section titled "TDG.MR.VERIFYREPORT leaf" in the TDX
+ * Module v1.0 specification for more information on TDG.MR.VERIFYREPORT
+ * TDCALL. It is used in the TDX guest driver module to verify the
+ * REPORTMACSTRUCT (part of TDREPORT struct which was generated via
+ * TDG.MR.TDREPORT TDCALL).
+ *
+ * Return 0 on success, or error code on other TDCALL failures.
+ */
+u64 tdx_mcall_verify_report(u8 *reportmac)
+{
+	return __tdx_module_call(TDX_VERIFYREPORT, virt_to_phys(reportmac),
+				0, 0, 0, 0, 0, 0, 0, NULL);
+}
+EXPORT_SYMBOL_GPL(tdx_mcall_verify_report);
+
+/**
+ * tdx_mcall_extend_rtmr() - Wrapper to extend RTMR registers using
+ *                           TDG.MR.RTMR.EXTEND TDCALL.
+ * @data: Address of the input buffer with RTMR register extend data.
+ * @index: Index of RTMR register to be extended.
+ *
+ * Refer to section titled "TDG.MR.RTMR.EXTEND leaf" in the TDX Module
+ * v1.0 specification for more information on TDG.MR.RTMR.EXTEND TDCALL.
+ * It is used in the TDX guest driver module to allow user extend the
+ * RTMR registers (index > 1).
+ *
+ * Return 0 on success, -EINVAL for invalid operands, -EBUSY for busy
+ * operation or -EIO on other TDCALL failures.
+ */
+int tdx_mcall_extend_rtmr(u8 *data, u8 index)
+{
+	u64 ret;
+
+	ret = __tdx_module_call(TDX_EXTEND_RTMR, virt_to_phys(data), index,
+				0, 0, 0, 0, 0, 0, NULL);
+	if (ret) {
+		if (TDCALL_RETURN_CODE(ret) == TDCALL_INVALID_OPERAND)
+			return -EINVAL;
+		if (TDCALL_RETURN_CODE(ret) == TDCALL_OPERAND_BUSY)
+			return -EBUSY;
+		return -EIO;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tdx_mcall_extend_rtmr);
+
+/**
+ * tdx_hcall_service() - Wrapper to request service from VMM
+ *                       using Service hypercall.
+ * @req: Address of the direct mapped command request buffer
+ *       which contains the service command.
+ * @resp: Address of the direct mapped command response buffer
+ *        to store service response.
+ * @timeout: Maximum Timeout in seconds for command request and
+ *           response.
+ *
+ * Refer to section titled "TDG.VP.VMCALL<Service>" in the TDX GHCI
+ * v1.5 specification for more information on Service hypercall.
+ * It is used in the TDX TPM driver to service TPM commands.
+ *
+ * Return 0 on success, error code on failure.
+ */
+int tdx_hcall_service(u8 *req, u8 *resp, u64 timeout)
+{
+	struct tdx_hypercall_args args = {0};
+
+	if (!tdx_event_irq)
+		return -EIO;
+
+	args.r10 = TDX_HYPERCALL_STANDARD;
+	args.r11 = TDVMCALL_SERVICE;
+	args.r12 = cc_mkdec(virt_to_phys(req));
+	args.r13 = cc_mkdec(virt_to_phys(resp));
+	args.r14 = tdx_event_irq_vector;
+	args.r15 = timeout;
+
+	return __tdx_hypercall(&args, 0);
+}
+EXPORT_SYMBOL_GPL(tdx_hcall_service);
+
+static void __noreturn tdx_panic(const char *msg)
+{
+	struct tdx_hypercall_args args = {
+		.r10 = TDX_HYPERCALL_STANDARD,
+		.r11 = TDVMCALL_REPORT_FATAL_ERROR,
+		.r12 = 0, /* Error code: 0 is Panic */
+	};
+	union {
+		/* Define register order according to the GHCI */
+		struct { u64 r14, r15, rbx, rdi, rsi, r8, r9, rdx; };
+
+		char str[64];
+	} message;
+
+	/* VMM assumes '\0' in byte 65, if the message took all 64 bytes */
+	strncpy(message.str, msg, 64);
+
+	args.r8  = message.r8;
+	args.r9  = message.r9;
+	args.r14 = message.r14;
+	args.r15 = message.r15;
+	args.rdi = message.rdi;
+	args.rsi = message.rsi;
+	args.rbx = message.rbx;
+	args.rdx = message.rdx;
+
+	/*
+	 * This hypercall should never return and it is not safe
+	 * to keep the guest running. Call it forever if it
+	 * happens to return.
+	 */
+	while (1)
+		__tdx_hypercall(&args, 0);
+}
+
+/**
+ * tdx_hcall_get_quote() - Wrapper to request TD Quote using GetQuote
+ *                         hypercall.
+ * @buf: Address of the directly mapped shared kernel buffer which
+ *	 contains TDREPORT data. The same buffer will be used by
+ *	 VMM to store the generated TD Quote output.
+ * @size: size of the tdquote buffer (4KB-aligned).
+ *
+ * Refer to section titled "TDG.VP.VMCALL<GetQuote>" in the TDX GHCI
+ * v1.0 specification for more information on GetQuote hypercall.
+ * It is used in the TDX guest driver module to get the TD Quote.
+ *
+ * Return 0 on success or error code on failure.
+ */
+int tdx_hcall_get_quote(u8 *buf, size_t size)
+{
+	struct tdx_hypercall_args args = {0};
+
+	args.r10 = TDX_HYPERCALL_STANDARD;
+	args.r11 = TDVMCALL_GET_QUOTE;
+	/* Since buf is a shared memory, set the shared (decrypted) bits */
+	args.r12 = cc_mkdec(virt_to_phys(buf));
+	args.r13 = size;
+
+	/*
+	 * Pass the physical address of TDREPORT to the VMM and
+	 * trigger the Quote generation. It is not a blocking
+	 * call, hence completion of this request will be notified to
+	 * the TD guest via a callback interrupt.
+	 */
+	return __tdx_hypercall(&args, 0);
+}
+EXPORT_SYMBOL_GPL(tdx_hcall_get_quote);
+
 static void tdx_parse_tdinfo(u64 *cc_mask)
 {
 	struct tdx_module_output out;
 	unsigned int gpa_width;
-	u64 td_attr;
 
 	/*
 	 * TDINFO TDX module call is used to get the TD execution environment
@@ -171,8 +360,15 @@ static void tdx_parse_tdinfo(u64 *cc_mask)
 	 * TD-private memory.  Only VMM-shared memory (MMIO) will #VE.
 	 */
 	td_attr = out.rdx;
-	if (!(td_attr & ATTR_SEPT_VE_DISABLE))
-		panic("TD misconfiguration: SEPT_VE_DISABLE attibute must be set.\n");
+	if (!(td_attr & ATTR_SEPT_VE_DISABLE)) {
+		const char *msg = "TD misconfiguration: SEPT_VE_DISABLE attribute must be set.";
+
+		/* Relax SEPT_VE_DISABLE check for debug TD. */
+		if (td_attr & ATTR_DEBUG)
+			pr_warn("%s\n", msg);
+		else
+			tdx_panic(msg);
+	}
 }
 
 /*
@@ -220,6 +416,11 @@ static int ve_instr_len(struct ve_info *ve)
 	}
 }
 
+bool tdx_debug_enabled(void)
+{
+	return !!(td_attr & ATTR_DEBUG);
+}
+
 static u64 __cpuidle __halt(const bool irq_disabled, const bool do_sti)
 {
 	struct tdx_hypercall_args args = {
@@ -240,7 +441,7 @@ static u64 __cpuidle __halt(const bool irq_disabled, const bool do_sti)
 	 * can keep the vCPU in virtual HLT, even if an IRQ is
 	 * pending, without hanging/breaking the guest.
 	 */
-	return __tdx_hypercall(&args, do_sti ? TDX_HCALL_ISSUE_STI : 0);
+	return __trace_tdx_hypercall(&args, do_sti ? TDX_HCALL_ISSUE_STI : 0);
 }
 
 static int handle_halt(struct ve_info *ve)
@@ -289,7 +490,7 @@ static int read_msr(struct pt_regs *regs, struct ve_info *ve)
 	 * can be found in TDX Guest-Host-Communication Interface
 	 * (GHCI), section titled "TDG.VP.VMCALL<Instruction.RDMSR>".
 	 */
-	if (__tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT))
+	if (__trace_tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT))
 		return -EIO;
 
 	regs->ax = lower_32_bits(args.r11);
@@ -311,10 +512,52 @@ static int write_msr(struct pt_regs *regs, struct ve_info *ve)
 	 * can be found in TDX Guest-Host-Communication Interface
 	 * (GHCI) section titled "TDG.VP.VMCALL<Instruction.WRMSR>".
 	 */
-	if (__tdx_hypercall(&args, 0))
+	if (__trace_tdx_hypercall(&args, 0))
 		return -EIO;
 
 	return ve_instr_len(ve);
+}
+
+/*
+ * TDX has context switched MSRs and emulated MSRs. The emulated MSRs
+ * normally trigger a #VE, but that is expensive, which can be avoided
+ * by doing a direct TDCALL. Unfortunately, this cannot be done for all
+ * because some MSRs are "context switched" and need WRMSR.
+ *
+ * The list for this is unfortunately quite long. To avoid maintaining
+ * very long switch statements just do a fast path for the few critical
+ * MSRs that need TDCALL, currently only TSC_DEADLINE.
+ *
+ * More can be added as needed.
+ *
+ * The others will be handled by the #VE handler as needed.
+ * See 18.1 "MSR virtualization" in the TDX Module EAS
+ */
+static bool tdx_fast_tdcall_path_msr(unsigned int msr)
+{
+	switch (msr) {
+	case MSR_IA32_TSC_DEADLINE:
+	case APIC_BASE_MSR + (APIC_ICR >> 4):
+		return true;
+	default:
+		return false;
+
+	}
+}
+
+static void notrace tdx_write_msr(unsigned int msr, u32 low, u32 high)
+{
+	struct tdx_hypercall_args args = {
+		.r10 = TDX_HYPERCALL_STANDARD,
+		.r11 = hcall_func(EXIT_REASON_MSR_WRITE),
+		.r12 = msr,
+		.r13 = (u64)high << 32 | low,
+	};
+
+	if (tdx_fast_tdcall_path_msr(msr))
+		__tdx_hypercall(&args, 0);
+	else
+		native_write_msr(msr, low, high);
 }
 
 static int handle_cpuid(struct pt_regs *regs, struct ve_info *ve)
@@ -325,6 +568,35 @@ static int handle_cpuid(struct pt_regs *regs, struct ve_info *ve)
 		.r12 = regs->ax,
 		.r13 = regs->cx,
 	};
+
+	/*
+	 * CPUID leaf 0x2 provides cache and TLB information.
+	 *
+	 * The leaf is obsolete. There are leafs that provides the same
+	 * information in a structured form. See leaf 0x4 on cache info and
+	 * leaf 0x18 on TLB info.
+	 */
+	if (regs->ax == 2) {
+		/*
+		 * Each byte in EAX/EBX/ECX/EDX is an informational descriptor.
+		 *
+		 * The least-significant byte in register EAX always returns
+		 * 0x01. Software should ignore this value and not interpret
+		 * it as an informational descriptor.
+		 *
+		 * Descriptors used here:
+		 *
+		 *  - 0xff: use CPUID leaf 0x4 to query cache parameters;
+		 *
+		 *  - 0xfe: use CPUID leaf 0x18 to query TLB and other address
+		 *          translation parameters.
+		 *
+		 * XXX: provide prefetch information?
+		 */
+		regs->ax = 0xf1ff01;
+		regs->bx = regs->cx = regs->dx = 0;
+		return ve_instr_len(ve);
+	}
 
 	/*
 	 * Only allow VMM to control range reserved for hypervisor
@@ -343,7 +615,7 @@ static int handle_cpuid(struct pt_regs *regs, struct ve_info *ve)
 	 * ABI can be found in TDX Guest-Host-Communication Interface
 	 * (GHCI), section titled "VP.VMCALL<Instruction.CPUID>".
 	 */
-	if (__tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT))
+	if (__trace_tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT))
 		return -EIO;
 
 	/*
@@ -370,7 +642,7 @@ static bool mmio_read(int size, unsigned long addr, unsigned long *val)
 		.r15 = *val,
 	};
 
-	if (__tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT))
+	if (__trace_tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT))
 		return false;
 	*val = args.r11;
 	return true;
@@ -394,6 +666,10 @@ static int handle_mmio(struct pt_regs *regs, struct ve_info *ve)
 	/* Only in-kernel MMIO is supported */
 	if (WARN_ON_ONCE(user_mode(regs)))
 		return -EFAULT;
+
+	if (!(ve->gpa & cc_mask)) {
+		panic("#VE due to access to unaccepted memory. GPA: %#llx\n", ve->gpa);
+	}
 
 	if (copy_from_kernel_nofault(buffer, (void *)regs->ip, MAX_INSN_SIZE))
 		return -EFAULT;
@@ -499,12 +775,18 @@ static bool handle_in(struct pt_regs *regs, int size, int port)
 	u64 mask = GENMASK(BITS_PER_BYTE * size, 0);
 	bool success;
 
+	if (!tdx_allowed_port(port)) {
+		regs->ax &= ~mask;
+		regs->ax |= (UINT_MAX & mask);
+		return true;
+	}
+
 	/*
 	 * Emulate the I/O read via hypercall. More info about ABI can be found
 	 * in TDX Guest-Host-Communication Interface (GHCI) section titled
 	 * "TDG.VP.VMCALL<Instruction.IO>".
 	 */
-	success = !__tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT);
+	success = !__trace_tdx_hypercall(&args, TDX_HCALL_HAS_OUTPUT);
 
 	/* Update part of the register affected by the emulated instruction */
 	regs->ax &= ~mask;
@@ -517,6 +799,9 @@ static bool handle_in(struct pt_regs *regs, int size, int port)
 static bool handle_out(struct pt_regs *regs, int size, int port)
 {
 	u64 mask = GENMASK(BITS_PER_BYTE * size, 0);
+
+	if (!tdx_allowed_port(port))
+		return true;
 
 	/*
 	 * Emulate the I/O write via hypercall. More info about ABI can be found
@@ -547,7 +832,6 @@ static int handle_io(struct pt_regs *regs, struct ve_info *ve)
 	in   = VE_IS_IO_IN(exit_qual);
 	size = VE_GET_IO_SIZE(exit_qual);
 	port = VE_GET_PORT_NUM(exit_qual);
-
 
 	if (in)
 		ret = handle_in(regs, size, port);
@@ -628,6 +912,11 @@ static int virt_exception_user(struct pt_regs *regs, struct ve_info *ve)
 	}
 }
 
+static inline bool is_private_gpa(u64 gpa)
+{
+	return gpa == cc_mkenc(gpa);
+}
+
 /*
  * Handle the kernel #VE.
  *
@@ -636,6 +925,11 @@ static int virt_exception_user(struct pt_regs *regs, struct ve_info *ve)
  */
 static int virt_exception_kernel(struct pt_regs *regs, struct ve_info *ve)
 {
+
+	trace_tdx_virtualization_exception_rcuidle(regs->ip, ve->exit_reason,
+			ve->exit_qual, ve->gpa, ve->instr_len, ve->instr_info,
+			regs->cx, regs->ax, regs->dx);
+
 	switch (ve->exit_reason) {
 	case EXIT_REASON_HLT:
 		return handle_halt(ve);
@@ -646,6 +940,8 @@ static int virt_exception_kernel(struct pt_regs *regs, struct ve_info *ve)
 	case EXIT_REASON_CPUID:
 		return handle_cpuid(regs, ve);
 	case EXIT_REASON_EPT_VIOLATION:
+		if (is_private_gpa(ve->gpa))
+			panic("Unexpected EPT-violation on private memory.");
 		return handle_mmio(regs, ve);
 	case EXIT_REASON_IO_INSTRUCTION:
 		return handle_io(regs, ve);
@@ -668,6 +964,17 @@ bool tdx_handle_virt_exception(struct pt_regs *regs, struct ve_info *ve)
 
 	/* After successful #VE handling, move the IP */
 	regs->ip += insn_len;
+
+	/*
+	 * Single-stepping through an emulated instruction is
+	 * two-fold: handling the #VE and raising a #DB. The
+	 * former is taken care of above; this tells the #VE
+	 * trap handler to do the latter. #DB is raised after
+	 * the instruction has been executed; the IP also needs
+	 * to be advanced in this case.
+	 */
+	if (regs->flags & X86_EFLAGS_TF)
+		return false;
 
 	return true;
 }
@@ -701,47 +1008,6 @@ static bool tdx_cache_flush_required(void)
 	return true;
 }
 
-static bool try_accept_one(phys_addr_t *start, unsigned long len,
-			  enum pg_level pg_level)
-{
-	unsigned long accept_size = page_level_size(pg_level);
-	u64 tdcall_rcx;
-	u8 page_size;
-
-	if (!IS_ALIGNED(*start, accept_size))
-		return false;
-
-	if (len < accept_size)
-		return false;
-
-	/*
-	 * Pass the page physical address to the TDX module to accept the
-	 * pending, private page.
-	 *
-	 * Bits 2:0 of RCX encode page size: 0 - 4K, 1 - 2M, 2 - 1G.
-	 */
-	switch (pg_level) {
-	case PG_LEVEL_4K:
-		page_size = 0;
-		break;
-	case PG_LEVEL_2M:
-		page_size = 1;
-		break;
-	case PG_LEVEL_1G:
-		page_size = 2;
-		break;
-	default:
-		return false;
-	}
-
-	tdcall_rcx = *start | page_size;
-	if (__tdx_module_call(TDX_ACCEPT_PAGE, tdcall_rcx, 0, 0, 0, NULL))
-		return false;
-
-	*start += accept_size;
-	return true;
-}
-
 /*
  * Inform the VMM of the guest's intent for this physical page: shared with
  * the VMM or private to the guest.  The VMM is expected to change its mapping
@@ -750,55 +1016,13 @@ static bool try_accept_one(phys_addr_t *start, unsigned long len,
 static bool tdx_enc_status_changed(unsigned long vaddr, int numpages, bool enc)
 {
 	phys_addr_t start = __pa(vaddr);
-	phys_addr_t end   = __pa(vaddr + numpages * PAGE_SIZE);
+	phys_addr_t end = __pa(vaddr + numpages * PAGE_SIZE);
 
-	if (!enc) {
-		/* Set the shared (decrypted) bits: */
-		start |= cc_mkdec(0);
-		end   |= cc_mkdec(0);
-	}
-
-	/*
-	 * Notify the VMM about page mapping conversion. More info about ABI
-	 * can be found in TDX Guest-Host-Communication Interface (GHCI),
-	 * section "TDG.VP.VMCALL<MapGPA>"
-	 */
-	if (_tdx_hypercall(TDVMCALL_MAP_GPA, start, end - start, 0, 0))
-		return false;
-
-	/* private->shared conversion  requires only MapGPA call */
-	if (!enc)
-		return true;
-
-	/*
-	 * For shared->private conversion, accept the page using
-	 * TDX_ACCEPT_PAGE TDX module call.
-	 */
-	while (start < end) {
-		unsigned long len = end - start;
-
-		/*
-		 * Try larger accepts first. It gives chance to VMM to keep
-		 * 1G/2M SEPT entries where possible and speeds up process by
-		 * cutting number of hypercalls (if successful).
-		 */
-
-		if (try_accept_one(&start, len, PG_LEVEL_1G))
-			continue;
-
-		if (try_accept_one(&start, len, PG_LEVEL_2M))
-			continue;
-
-		if (!try_accept_one(&start, len, PG_LEVEL_4K))
-			return false;
-	}
-
-	return true;
+	return tdx_enc_status_changed_phys(start, end, enc);
 }
 
 void __init tdx_early_init(void)
 {
-	u64 cc_mask;
 	u32 eax, sig[3];
 
 	cpuid_count(TDX_CPUID_LEAF_ID, 0, &eax, &sig[0], &sig[2],  &sig[1]);
@@ -807,10 +1031,43 @@ void __init tdx_early_init(void)
 		return;
 
 	setup_force_cpu_cap(X86_FEATURE_TDX_GUEST);
+	setup_clear_cpu_cap(X86_FEATURE_MCE);
+	setup_clear_cpu_cap(X86_FEATURE_MTRR);
+	setup_clear_cpu_cap(X86_FEATURE_TME);
+
+	/*
+	 * The only secure (monotonous) timer inside a TD guest
+	 * is the TSC. The TDX module does various checks on the TSC.
+	 * There are no other reliable fall back options. Also checking
+	 * against jiffies is very unreliable. So force the TSC reliable.
+	 */
+	setup_force_cpu_cap(X86_FEATURE_TSC_RELIABLE);
+
+	/*
+	 * In TDX relying on environmental noise like interrupt
+	 * timing alone is dubious, because it can be directly
+	 * controlled by a untrusted hypervisor. Make sure to
+	 * mix in the CPU hardware random number generator too.
+	 */
+	random_enable_trust_cpu();
+
+	/*
+	 * Make sure there is a panic if something goes wrong,
+	 * just in case it's some kind of host attack.
+	 */
+	panic_on_oops = 1;
+
+	/* Set restricted memory access for virtio. */
+	virtio_set_mem_acc_cb(virtio_require_restricted_mem_acc);
+
+	pv_ops.cpu.write_msr = tdx_write_msr;
 
 	cc_set_vendor(CC_VENDOR_INTEL);
 	tdx_parse_tdinfo(&cc_mask);
 	cc_set_mask(cc_mask);
+
+	/* Kernel does not use NOTIFY_ENABLES and does not need random #VEs */
+	tdx_module_call(TDX_WR, 0, TDCS_NOTIFY_ENABLES, 0, -1ULL, NULL);
 
 	/*
 	 * All bits above GPA width are reserved and kernel treats shared bit
@@ -824,5 +1081,171 @@ void __init tdx_early_init(void)
 	x86_platform.guest.enc_tlb_flush_required   = tdx_tlb_flush_required;
 	x86_platform.guest.enc_status_change_finish = tdx_enc_status_changed;
 
+	legacy_pic = &null_legacy_pic;
+
+	pci_disable_early();
+	pci_disable_mmconf();
+
 	pr_info("Guest detected\n");
 }
+
+static irqreturn_t tdx_event_irq_handler(int irq, void *dev_id)
+{
+	struct event_irq_entry *entry;
+
+	spin_lock(&event_irq_cb_lock);
+	list_for_each_entry(entry, &event_irq_cb_list, head) {
+		if (entry->handler)
+			entry->handler(entry->data);
+	}
+	spin_unlock(&event_irq_cb_lock);
+
+	return IRQ_HANDLED;
+}
+
+/**
+ * tdx_event_irq_init() - Register IRQ for event notification from the VMM to
+ *			  the TDX Guest.
+ *
+ * Use SetupEventNotifyInterrupt TDVMCALL to register the event notification
+ * IRQ with the VMM, which is used by the VMM to notify the TDX guest when
+ * needed, for instance, when VMM finishes the GetQuote request from the TDX
+ * guest. The VMM always notifies the TDX guest via the same CPU that calls
+ * the SetupEventNotifyInterrupt TDVMCALL. Allocate an IRQ/vector from the
+ * x86_vector_domain and pin it on the same CPU on which TDVMCALL is called.
+ * For simplicity, use early_initcall() to allow both IRQ allocation and
+ * TDVMCALL to use BSP.
+ */
+static int __init tdx_event_irq_init(void)
+{
+	struct irq_affinity_desc desc;
+	struct irq_alloc_info info;
+	struct irq_cfg *cfg;
+	int irq;
+
+	if (!cpu_feature_enabled(X86_FEATURE_TDX_GUEST))
+		return 0;
+
+	init_irq_alloc_info(&info, NULL);
+
+	cpumask_set_cpu(smp_processor_id(), &desc.mask);
+
+	irq = __irq_domain_alloc_irqs(x86_vector_domain, -1, 1,
+				      cpu_to_node(smp_processor_id()), &info,
+				      false, &desc);
+	if (irq <= 0) {
+		pr_err("Event notification IRQ allocation failed %d\n", irq);
+		return -EIO;
+	}
+
+	irq_set_handler(irq, handle_edge_irq);
+
+	/*
+	 * The IRQ cannot be migrated because VMM always notifies the TDX
+	 * guest on the same CPU on which the SetupEventNotifyInterrupt
+	 * TDVMCALL is called. Set the IRQ with IRQF_NOBALANCING to prevent
+	 * its affinity from being changed.
+	 */
+	if (request_irq(irq, tdx_event_irq_handler, IRQF_NOBALANCING,
+			"tdx_event_irq", NULL)) {
+		pr_err("Event notification IRQ request failed\n");
+		goto err_free_domain_irqs;
+	}
+
+	cfg = irq_cfg(irq);
+
+	if (_tdx_hypercall(TDVMCALL_SETUP_NOTIFY_INTR, cfg->vector, 0, 0, 0)) {
+		pr_err("Event notification hypercall failed\n");
+		goto err_free_irqs;
+	}
+
+	tdx_event_irq = irq;
+	tdx_event_irq_vector = cfg->vector;
+
+	return 0;
+
+err_free_irqs:
+	free_irq(irq, NULL);
+err_free_domain_irqs:
+	irq_domain_free_irqs(irq, 1);
+
+	return -EIO;
+}
+early_initcall(tdx_event_irq_init)
+
+/**
+ * tdx_register_event_irq_cb() - Register TDX event IRQ callback handler.
+ * @handler: Address of driver specific event IRQ callback handler. Handler
+ *           will be called in IRQ context and hence cannot sleep.
+ * @data: Context data to be passed to the callback handler.
+ *
+ * Return: 0 on success or standard error code on other failures.
+ */
+int tdx_register_event_irq_cb(tdx_event_irq_cb_t handler, void *data)
+{
+	struct event_irq_entry *entry;
+	unsigned long flags;
+
+	if (tdx_event_irq <= 0)
+		return -EIO;
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->data = data;
+	entry->handler = handler;
+
+	spin_lock_irqsave(&event_irq_cb_lock, flags);
+	list_add_tail(&entry->head, &event_irq_cb_list);
+	spin_unlock_irqrestore(&event_irq_cb_lock, flags);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tdx_register_event_irq_cb);
+
+/**
+ * tdx_unregister_event_irq_cb() - Unregister TDX event IRQ callback handler.
+ * @handler: Address of driver specific event IRQ callback handler.
+ * @data: Context data to be passed to the callback handler.
+ *
+ * Return: 0 on success or -EIO if event IRQ is not allocated.
+ */
+int tdx_unregister_event_irq_cb(tdx_event_irq_cb_t handler, void *data)
+{
+	struct event_irq_entry *entry;
+	unsigned long flags;
+
+	if (tdx_event_irq <= 0)
+		return -EIO;
+
+	spin_lock_irqsave(&event_irq_cb_lock, flags);
+	list_for_each_entry(entry, &event_irq_cb_list, head) {
+		if (entry->handler == handler && entry->data == data) {
+			list_del(&entry->head);
+			kfree(entry);
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&event_irq_cb_lock, flags);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tdx_unregister_event_irq_cb);
+
+static struct platform_device tpm_device = {
+	.name = "tpm",
+	.id = -1,
+};
+
+static int __init tdx_device_init(void)
+{
+	if (!cpu_feature_enabled(X86_FEATURE_TDX_GUEST))
+		return 0;
+
+	if (platform_device_register(&tpm_device))
+		pr_warn("TPM device register failed\n");
+
+	return 0;
+}
+device_initcall(tdx_device_init)

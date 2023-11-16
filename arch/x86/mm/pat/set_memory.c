@@ -1912,6 +1912,7 @@ int __set_memory_prot(unsigned long addr, int numpages, pgprot_t prot)
 					__pgprot(~pgprot_val(prot)), 0, 0,
 					NULL);
 }
+EXPORT_SYMBOL_GPL(__set_memory_prot);
 
 int _set_memory_uc(unsigned long addr, int numpages)
 {
@@ -2095,6 +2096,7 @@ int set_memory_np(unsigned long addr, int numpages)
 {
 	return change_page_attr_clear(&addr, numpages, __pgprot(_PAGE_PRESENT), 0);
 }
+EXPORT_SYMBOL_GPL(set_memory_np);
 
 int set_memory_np_noalias(unsigned long addr, int numpages)
 {
@@ -2125,7 +2127,7 @@ int set_memory_global(unsigned long addr, int numpages)
  * __set_memory_enc_pgtable() is used for the hypervisors that get
  * informed about "encryption" status via page tables.
  */
-static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
+static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc, bool flush)
 {
 	pgprot_t empty = __pgprot(0);
 	struct cpa_data cpa;
@@ -2147,7 +2149,7 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 	vm_unmap_aliases();
 
 	/* Flush the caches as needed before changing the encryption attribute. */
-	if (x86_platform.guest.enc_tlb_flush_required(enc))
+	if (flush && x86_platform.guest.enc_tlb_flush_required(enc))
 		cpa_flush(&cpa, x86_platform.guest.enc_cache_flush_required());
 
 	/* Notify hypervisor that we are about to set/clr encryption attribute. */
@@ -2173,28 +2175,34 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 	return ret;
 }
 
-static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc)
+static int __set_memory_enc_dec(unsigned long addr, int numpages, bool enc, bool flush)
 {
 	if (hv_is_isolation_supported())
 		return hv_set_mem_host_visibility(addr, numpages, !enc);
 
 	if (cc_platform_has(CC_ATTR_MEM_ENCRYPT))
-		return __set_memory_enc_pgtable(addr, numpages, enc);
+		return __set_memory_enc_pgtable(addr, numpages, enc, flush);
 
 	return 0;
 }
 
 int set_memory_encrypted(unsigned long addr, int numpages)
 {
-	return __set_memory_enc_dec(addr, numpages, true);
+	return __set_memory_enc_dec(addr, numpages, true, true);
 }
 EXPORT_SYMBOL_GPL(set_memory_encrypted);
 
 int set_memory_decrypted(unsigned long addr, int numpages)
 {
-	return __set_memory_enc_dec(addr, numpages, false);
+	return __set_memory_enc_dec(addr, numpages, false, true);
 }
 EXPORT_SYMBOL_GPL(set_memory_decrypted);
+
+int set_memory_decrypted_noflush(unsigned long addr, int numpages)
+{
+	return __set_memory_enc_dec(addr, numpages, false, false);
+}
+EXPORT_SYMBOL_GPL(set_memory_decrypted_noflush);
 
 int set_pages_uc(struct page *page, int numpages)
 {
@@ -2351,11 +2359,28 @@ int set_direct_map_invalid_noflush(struct page *page)
 {
 	return __set_pages_np(page, 1);
 }
+EXPORT_SYMBOL_GPL(set_direct_map_invalid_noflush);
 
 int set_direct_map_default_noflush(struct page *page)
 {
 	return __set_pages_p(page, 1);
 }
+EXPORT_SYMBOL_GPL(set_direct_map_default_noflush);
+
+int set_direct_map_split_noflush(struct page *page)
+{
+	/* Hack to forcibly split direct map. */
+	unsigned long tempaddr = (unsigned long) page_address(page);
+	struct cpa_data cpa = { .vaddr = &tempaddr,
+				.pgd = NULL,
+				.numpages = 1,
+				.mask_set = __pgprot(_PAGE_PRESENT | _PAGE_RW),
+				.mask_clr = __pgprot(0),
+				.flags = 0,
+				.force_split = 1};
+	return __change_page_attr_set_clr(&cpa, 0);
+}
+EXPORT_SYMBOL_GPL(set_direct_map_split_noflush);
 
 #ifdef CONFIG_DEBUG_PAGEALLOC
 void __kernel_map_pages(struct page *page, int numpages, int enable)

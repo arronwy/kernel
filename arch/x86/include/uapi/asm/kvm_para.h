@@ -37,6 +37,12 @@
 #define KVM_FEATURE_HC_MAP_GPA_RANGE	16
 #define KVM_FEATURE_MIGRATION_CONTROL	17
 
+/* Trusted features that are allowed in a confidential guest */
+/* Add more as needed */
+#define KVM_FEATURES_TRUSTED		 \
+	(BIT(KVM_FEATURE_NOP_IO_DELAY) | \
+	 BIT(KVM_FEATURE_PV_SEND_IPI))
+
 #define KVM_HINTS_REALTIME      0
 
 /* The last 8 bits are used to indicate how to interpret the flags field
@@ -101,9 +107,15 @@ struct kvm_clock_pairing {
 #define KVM_MAP_GPA_RANGE_PAGE_SZ_4K	0
 #define KVM_MAP_GPA_RANGE_PAGE_SZ_2M	(1 << 0)
 #define KVM_MAP_GPA_RANGE_PAGE_SZ_1G	(1 << 1)
+#define KVM_MAP_GPA_RANGE_PAGE_SZ_MASK	(3)
 #define KVM_MAP_GPA_RANGE_ENC_STAT(n)	(n << 4)
 #define KVM_MAP_GPA_RANGE_ENCRYPTED	KVM_MAP_GPA_RANGE_ENC_STAT(1)
 #define KVM_MAP_GPA_RANGE_DECRYPTED	KVM_MAP_GPA_RANGE_ENC_STAT(0)
+#define KVM_MAP_GPA_RANGE_ENC_MASK	KVM_MAP_GPA_RANGE_ENC_STAT(1)
+#define KVM_MAP_GPA_RANGE_GET_ATTR	(1 << 5)
+
+#define KVM_MAP_GPA_RANGE_GPA_PRIVATE		0
+#define KVM_MAP_GPA_RANGE_GPA_SHARED		1
 
 /* Operations for KVM_HC_MMU_OP */
 #define KVM_MMU_OP_WRITE_PTE            1

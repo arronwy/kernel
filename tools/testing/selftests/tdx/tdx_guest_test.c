@@ -18,6 +18,7 @@
 #define TDX_GUEST_DEVNAME "/dev/tdx_guest"
 #define HEX_DUMP_SIZE 8
 #define DEBUG 0
+#define QUOTE_SIZE 8192
 
 /**
  * struct tdreport_type - Type header of TDREPORT_STRUCT.
@@ -128,21 +129,29 @@ static void print_array_hex(const char *title, const char *prefix_str,
 	printf("\n");
 }
 
+/* Helper function to get TDREPORT */
+long get_tdreport0(int devfd, struct tdx_report_req *req)
+{
+	int i;
+
+	/* Generate sample report data */
+	for (i = 0; i < TDX_REPORTDATA_LEN; i++)
+		req->reportdata[i] = i;
+
+	return ioctl(devfd, TDX_CMD_GET_REPORT0, req);
+}
+
 TEST(verify_report)
 {
 	struct tdx_report_req req;
 	struct tdreport *tdreport;
-	int devfd, i;
+	int devfd;
 
 	devfd = open(TDX_GUEST_DEVNAME, O_RDWR | O_SYNC);
 	ASSERT_LT(0, devfd);
 
-	/* Generate sample report data */
-	for (i = 0; i < TDX_REPORTDATA_LEN; i++)
-		req.reportdata[i] = i;
-
 	/* Get TDREPORT */
-	ASSERT_EQ(0, ioctl(devfd, TDX_CMD_GET_REPORT0, &req));
+	ASSERT_EQ(0, get_tdreport0(devfd, &req));
 
 	if (DEBUG) {
 		print_array_hex("\n\t\tTDX report data\n", "",
@@ -160,4 +169,92 @@ TEST(verify_report)
 	ASSERT_EQ(0, close(devfd));
 }
 
+TEST(verify_reportmac)
+{
+	struct tdx_verify_report_req req = { };
+	struct tdx_report_req rep_req;
+	struct tdreport *tdreport;
+	int devfd, ret;
+
+	devfd = open(TDX_GUEST_DEVNAME, O_RDWR | O_SYNC);
+
+	ASSERT_LT(0, devfd);
+
+	/* Get TDREPORT */
+	ASSERT_EQ(0, get_tdreport0(devfd, &rep_req));
+
+	/* Fill VERIFYREPORT request */
+	tdreport = (struct tdreport *)rep_req.tdreport;
+	memcpy(req.reportmac, &tdreport->reportmac, sizeof(req.reportmac));
+
+	/* Verify reportmac and make sure it is valid */
+	ret = ioctl(devfd, TDX_CMD_VERIFY_REPORT, &req);
+	if (DEBUG && ret)
+		printf("verify_report TDCALL failed, err:%llx\n", req.err_code);
+
+	ASSERT_EQ(0, ret);
+
+	ASSERT_EQ(0, close(devfd));
+}
+
+TEST(verify_rtmr_extend)
+{
+	struct tdx_extend_rtmr_req req;
+	int devfd, i;
+
+	devfd = open(TDX_GUEST_DEVNAME, O_RDWR | O_SYNC);
+
+	ASSERT_LT(0, devfd);
+
+	/* Generate sample RTMR extend data */
+	for (i = 0; i < TDX_EXTEND_RTMR_DATA_LEN; i++)
+		req.data[i] = i;
+
+	req.index = 2;
+
+	/* Verify reportmac and make sure it is valid */
+	ASSERT_EQ(0, ioctl(devfd, TDX_CMD_EXTEND_RTMR, &req));
+
+	ASSERT_EQ(0, close(devfd));
+}
+
+TEST(verify_quote)
+{
+	struct tdx_quote_buf *quote_buf;
+	struct tdx_report_req rep_req;
+	struct tdx_quote_req req;
+	__u64 quote_buf_size;
+	int devfd;
+
+	/* Open attestation device */
+	/* Add size for quote header */
+	quote_buf_size = sizeof(*quote_buf) + QUOTE_SIZE;
+
+	/* Allocate quote buffer */
+	quote_buf = (struct tdx_quote_buf *)malloc(quote_buf_size);
+	ASSERT_NE(NULL, quote_buf);
+
+	/* Initialize GetQuote header */
+	quote_buf->version = 1;
+	quote_buf->status  = GET_QUOTE_SUCCESS;
+	quote_buf->in_len  = TDX_REPORT_LEN;
+	quote_buf->out_len = 0;
+
+	/* Get TDREPORT data */
+	ASSERT_EQ(0, get_tdreport0(devfd, &rep_req));
+
+	/* Fill GetQuote request */
+	memcpy(quote_buf->data, rep_req.tdreport, TDX_REPORT_LEN);
+	req.buf	  = (__u64)quote_buf;
+	req.len	  = quote_buf_size;
+
+	ASSERT_EQ(0, ioctl(devfd, TDX_CMD_GET_QUOTE, &req));
+
+	/* Check whether GetQuote request is successful */
+	EXPECT_EQ(0, quote_buf->status);
+
+	free(quote_buf);
+
+	ASSERT_EQ(0, close(devfd));
+}
 TEST_HARNESS_MAIN

@@ -5,8 +5,13 @@
 
 #include <linux/init.h>
 #include <linux/bits.h>
+#include <asm/errno.h>
 #include <asm/ptrace.h>
 #include <asm/shared/tdx.h>
+
+#ifdef CONFIG_INTEL_TDX_HOST
+
+#include <asm/trapnr.h>
 
 /*
  * SW-defined error codes.
@@ -14,26 +19,35 @@
  * Bits 47:40 == 0xFF indicate Reserved status code class that never used by
  * TDX module.
  */
-#define TDX_ERROR			_BITUL(63)
+#define TDX_ERROR_BIT			63
+#define TDX_ERROR			_BITUL(TDX_ERROR_BIT)
 #define TDX_SW_ERROR			(TDX_ERROR | GENMASK_ULL(47, 40))
 #define TDX_SEAMCALL_VMFAILINVALID	(TDX_SW_ERROR | _UL(0xFFFF0000))
+#define TDX_SEAMCALL_VMFAILVALID	(TDX_SW_ERROR | _UL(0xFFFE0000))
+
+#define TDX_SEAMCALL_GP			(TDX_SW_ERROR | X86_TRAP_GP)
+#define TDX_SEAMCALL_UD			(TDX_SW_ERROR | X86_TRAP_UD)
+
+#endif
+
+#define TDX_NON_RECOVERABLE_BIT		62
+/*
+ * Error with the non-recoverable bit cleared indicates that the error is
+ * likely recoverable (e.g. due to lock busy in TDX module), and the seamcall
+ * can be retried.
+ */
+#define TDX_SEAMCALL_ERR_RECOVERABLE(err) \
+	(err >> TDX_NON_RECOVERABLE_BIT == 0x2)
+
+/* The max number of seamcall retries */
+#define TDX_SEAMCALL_RETRY_MAX	10000
 
 #ifndef __ASSEMBLY__
 
-/*
- * Used to gather the output registers values of the TDCALL and SEAMCALL
- * instructions when requesting services from the TDX module.
- *
- * This is a software only structure and not part of the TDX module/VMM ABI.
- */
-struct tdx_module_output {
-	u64 rcx;
-	u64 rdx;
-	u64 r8;
-	u64 r9;
-	u64 r10;
-	u64 r11;
-};
+/* TDX supported page sizes from the TDX module ABI. */
+#define TDX_PS_4K	0
+#define TDX_PS_2M	1
+#define TDX_PS_1G	2
 
 /*
  * Used by the #VE exception handler to gather the #VE exception
@@ -53,13 +67,14 @@ struct ve_info {
 
 #ifdef CONFIG_INTEL_TDX_GUEST
 
-void __init tdx_early_init(void);
+typedef int (*tdx_event_irq_cb_t)(void *);
 
-/* Used to communicate with the TDX module */
-u64 __tdx_module_call(u64 fn, u64 rcx, u64 rdx, u64 r8, u64 r9,
-		      struct tdx_module_output *out);
+void __init tdx_early_init(void);
+bool tdx_debug_enabled(void);
 
 void tdx_get_ve_info(struct ve_info *ve);
+
+void __init tdx_filter_init(void);
 
 bool tdx_handle_virt_exception(struct pt_regs *regs, struct ve_info *ve);
 
@@ -69,10 +84,29 @@ bool tdx_early_handle_ve(struct pt_regs *regs);
 
 int tdx_mcall_get_report0(u8 *reportdata, u8 *tdreport);
 
+bool tdx_enc_status_changed_phys(phys_addr_t start, phys_addr_t end, bool enc);
+
+u64 tdx_mcall_verify_report(u8 *reportmac);
+
+int tdx_mcall_extend_rtmr(u8 *data, u8 index);
+
+bool tdx_allowed_port(short int port);
+
+int tdx_register_event_irq_cb(tdx_event_irq_cb_t handler, void *data);
+
+int tdx_unregister_event_irq_cb(tdx_event_irq_cb_t handler, void *data);
+
+int tdx_hcall_get_quote(u8 *buf, size_t size);
+
+int tdx_hcall_service(u8 *req, u8 *resp, u64 timeout);
+
+void ccel_record_eventlog(void *data, u8 index);
+
 #else
 
 static inline void tdx_early_init(void) { };
 static inline void tdx_safe_halt(void) { };
+static inline void tdx_filter_init(void) { };
 
 static inline bool tdx_early_handle_ve(struct pt_regs *regs) { return false; }
 
@@ -89,5 +123,97 @@ static inline long tdx_kvm_hypercall(unsigned int nr, unsigned long p1,
 	return -ENODEV;
 }
 #endif /* CONFIG_INTEL_TDX_GUEST && CONFIG_KVM_GUEST */
+
+#ifdef CONFIG_INTEL_TDX_HOST
+
+/* -1 indicates CPUID leaf with no sub-leaves. */
+#define TDX_CPUID_NO_SUBLEAF	((u32)-1)
+struct tdx_cpuid_config {
+	u32	leaf;
+	u32	sub_leaf;
+	u32	eax;
+	u32	ebx;
+	u32	ecx;
+	u32	edx;
+} __packed;
+
+#define TDSYSINFO_STRUCT_SIZE		1024
+#define TDSYSINFO_STRUCT_ALIGNMENT	1024
+
+/*
+ * The size of this structure itself is flexible.  The actual structure
+ * passed to TDH.SYS.INFO must be padded to TDSYSINFO_STRUCT_SIZE and be
+ * aligned to TDSYSINFO_STRUCT_ALIGNMENT using DECLARE_PADDED_STRUCT().
+ */
+struct tdsysinfo_struct {
+	/* TDX-SEAM Module Info */
+	u32	attributes;
+	u32	vendor_id;
+	u32	build_date;
+	u16	build_num;
+	u16	minor_version;
+	u16	major_version;
+	u8	sys_rd;
+	u8	reserved0[13];
+	/* Memory Info */
+	u16	max_tdmrs;
+	u16	max_reserved_per_tdmr;
+	u16	pamt_entry_size;
+	u8	reserved1[10];
+	/* Control Struct Info */
+	u16	tdcs_base_size;
+	u8	reserved2[2];
+	u16	tdvps_base_size;
+	u8	tdvps_xfam_dependent_size;
+	u8	reserved3[9];
+	/* TD Capabilities */
+	u64	attributes_fixed0;
+	u64	attributes_fixed1;
+	u64	xfam_fixed0;
+	u64	xfam_fixed1;
+	u8	reserved4[32];
+	u32	num_cpuid_config;
+	/*
+	 * The actual number of CPUID_CONFIG depends on above
+	 * 'num_cpuid_config'.
+	 */
+	DECLARE_FLEX_ARRAY(struct tdx_cpuid_config, cpuid_configs);
+} __packed;
+
+const struct tdsysinfo_struct *tdx_get_sysinfo(void);
+bool platform_tdx_enabled(void);
+int tdx_enable(void);
+/*
+ * Key id globally used by TDX module: TDX module maps TDR with this TDX global
+ * key id.  TDR includes key id assigned to the TD.  Then TDX module maps other
+ * TD-related pages with the assigned key id.  TDR requires this TDX global key
+ * id for cache flush unlike other TD-related pages.
+ */
+extern u32 tdx_global_keyid __read_mostly;
+u32 tdx_get_num_keyid(void);
+int tdx_keyid_alloc(void);
+void tdx_keyid_free(int keyid);
+
+u64 __seamcall(u64 op, u64 rcx, u64 rdx, u64 r8, u64 r9, u64 r10,
+	       u64 r11, u64 r12, u64 r13, struct tdx_module_output *out);
+#else	/* !CONFIG_INTEL_TDX_HOST */
+struct tdsysinfo_struct;
+static inline const struct tdsysinfo_struct *tdx_get_sysinfo(void) { return NULL; }
+static inline bool platform_tdx_enabled(void) { return false; }
+static inline int tdx_enable(void)  { return -EINVAL; }
+static inline u32 tdx_get_num_keyid(void) { return 0; }
+static inline int tdx_keyid_alloc(void) { return -EOPNOTSUPP; }
+static inline void tdx_keyid_free(int keyid) { }
+#endif	/* CONFIG_INTEL_TDX_HOST */
+
+#ifdef CONFIG_INTEL_TDX_MODULE_UPDATE
+int tdx_module_update(bool live_update, bool *recoverable);
+#else /* !CONFIG_INTEL_TDX_MODULE_UPDATE */
+static inline int tdx_module_update(bool live_update, bool *recoverable)
+{
+	return -EOPNOTSUPP;
+}
+#endif /* CONFIG_INTEL_TDX_MODULE_UPDATE */
+
 #endif /* !__ASSEMBLY__ */
 #endif /* _ASM_X86_TDX_H */

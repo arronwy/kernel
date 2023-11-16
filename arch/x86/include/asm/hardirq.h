@@ -19,6 +19,9 @@ typedef struct {
 	unsigned int kvm_posted_intr_ipis;
 	unsigned int kvm_posted_intr_wakeup_ipis;
 	unsigned int kvm_posted_intr_nested_ipis;
+#ifdef CONFIG_INTEL_TDX_HOST
+	unsigned int kvm_tdx_guest_pmis;
+#endif
 #endif
 	unsigned int x86_platform_ipis;	/* arch dependent */
 	unsigned int apic_perf_irqs;
@@ -43,6 +46,9 @@ typedef struct {
 #if IS_ENABLED(CONFIG_HYPERV)
 	unsigned int irq_hv_reenlightenment_count;
 	unsigned int hyperv_stimer0_count;
+#endif
+#if IS_ENABLED(CONFIG_INTEL_TDX_GUEST)
+	unsigned int tdx_ve_count;
 #endif
 } ____cacheline_aligned irq_cpustat_t;
 
